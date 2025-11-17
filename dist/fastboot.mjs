@@ -182,7 +182,7 @@ function parseChunkHeader(buffer) {
         /* 2: reserved, 16 bits */
         blocks: view.getUint32(4, true),
         dataBytes: view.getUint32(8, true) - CHUNK_HEADER_SIZE,
-        data: null,
+        data: null, // to be populated by consumer
     };
 }
 function calcChunksBlockSize(chunks) {
@@ -270,6 +270,9 @@ async function fromRaw(blob) {
  */
 async function* splitBlob(blob, splitSize) {
     logDebug(`Splitting ${blob.size}-byte sparse image into ${splitSize}-byte chunks`);
+    // 7/8 is a safe value for the split size, to account for extra overhead
+    // AOSP source code does the same
+    const safeSendValue = Math.floor(splitSize * (7 / 8));
     // Short-circuit if splitting isn't required
     if (blob.size <= splitSize) {
         logDebug("Blob fits in 1 payload, not splitting");
@@ -291,49 +294,74 @@ async function* splitBlob(blob, splitSize) {
     let splitDataBytes = 0;
     for (let i = 0; i < header.chunks; i++) {
         let chunkHeaderData = await readBlobAsBuffer(blob.slice(0, CHUNK_HEADER_SIZE));
-        let chunk = parseChunkHeader(chunkHeaderData);
-        chunk.data = blob.slice(CHUNK_HEADER_SIZE, CHUNK_HEADER_SIZE + chunk.dataBytes);
-        blob = blob.slice(CHUNK_HEADER_SIZE + chunk.dataBytes);
-        let bytesRemaining = splitSize - calcChunksSize(splitChunks);
-        logVerbose(`  Chunk ${i}: type ${chunk.type}, ${chunk.dataBytes} bytes / ${chunk.blocks} blocks, ${bytesRemaining} bytes remaining`);
-        if (bytesRemaining >= chunk.dataBytes) {
-            // Read the chunk and add it
-            logVerbose("    Space is available, adding chunk");
-            splitChunks.push(chunk);
-            // Track amount of data written on the output device, in bytes
-            splitDataBytes += chunk.blocks * header.blockSize;
+        let originalChunk = parseChunkHeader(chunkHeaderData);
+        originalChunk.data = blob.slice(CHUNK_HEADER_SIZE, CHUNK_HEADER_SIZE + originalChunk.dataBytes);
+        blob = blob.slice(CHUNK_HEADER_SIZE + originalChunk.dataBytes);
+        let chunksToProcess = [];
+        // take into account cases where the chunk data is bigger than the maximum allowed download size
+        if (originalChunk.dataBytes > safeSendValue) {
+            logDebug(`Data of chunk ${i} is bigger than the maximum allowed download size: ${originalChunk.dataBytes} > ${safeSendValue}`);
+            // we should now split this chunk into multiple chunks that fit
+            let originalDataBytes = originalChunk.dataBytes;
+            let originalData = originalChunk.data;
+            while (originalDataBytes > 0) {
+                const toSend = Math.min(safeSendValue, originalDataBytes);
+                chunksToProcess.push({
+                    type: originalChunk.type,
+                    dataBytes: toSend,
+                    data: originalData.slice(0, toSend),
+                    blocks: toSend / header?.blockSize
+                });
+                originalData = originalData.slice(toSend);
+                originalDataBytes -= toSend;
+            }
+            logDebug("chunksToProcess", chunksToProcess);
         }
         else {
-            // Out of space, finish this split
-            // Blocks need to be calculated from chunk headers instead of going by size
-            // because FILL and SKIP chunks cover more blocks than the data they contain.
-            let splitBlocks = calcChunksBlockSize(splitChunks);
-            splitChunks.push({
-                type: ChunkType.Skip,
-                blocks: header.blocks - splitBlocks,
-                data: new Blob([]),
-                dataBytes: 0,
-            });
-            logVerbose(`Partition is ${header.blocks} blocks, used ${splitBlocks}, padded with ${header.blocks - splitBlocks}, finishing split with ${calcChunksBlockSize(splitChunks)} blocks`);
-            let splitImage = await createImage(header, splitChunks);
-            logDebug(`Finished ${splitImage.size}-byte split with ${splitChunks.length} chunks`);
-            yield {
-                data: await readBlobAsBuffer(splitImage),
-                bytes: splitDataBytes,
-            };
-            // Start a new split. Every split is considered a full image by the
-            // bootloader, so we need to skip the *total* written blocks.
-            logVerbose(`Starting new split: skipping first ${splitBlocks} blocks and adding chunk`);
-            splitChunks = [
-                {
+            chunksToProcess.push(originalChunk);
+        }
+        for (const chunk of chunksToProcess) {
+            let bytesRemaining = splitSize - calcChunksSize(splitChunks);
+            logVerbose(`  Chunk ${i}: type ${chunk.type}, ${chunk.dataBytes} bytes / ${chunk.blocks} blocks, ${bytesRemaining} bytes remaining`);
+            if (bytesRemaining >= chunk.dataBytes) {
+                // Read the chunk and add it
+                logVerbose("    Space is available, adding chunk");
+                splitChunks.push(chunk);
+                // Track amount of data written on the output device, in bytes
+                splitDataBytes += chunk.blocks * header.blockSize;
+            }
+            else {
+                // Out of space, finish this split
+                // Blocks need to be calculated from chunk headers instead of going by size
+                // because FILL and SKIP chunks cover more blocks than the data they contain.
+                let splitBlocks = calcChunksBlockSize(splitChunks);
+                splitChunks.push({
                     type: ChunkType.Skip,
-                    blocks: splitBlocks,
+                    blocks: header.blocks - splitBlocks,
                     data: new Blob([]),
                     dataBytes: 0,
-                },
-                chunk,
-            ];
-            splitDataBytes = 0;
+                });
+                logVerbose(`Partition is ${header.blocks} blocks, used ${splitBlocks}, padded with ${header.blocks - splitBlocks}, finishing split with ${calcChunksBlockSize(splitChunks)} blocks`);
+                let splitImage = await createImage(header, splitChunks);
+                logDebug(`Finished ${splitImage.size}-byte split with ${splitChunks.length} chunks`);
+                yield {
+                    data: await readBlobAsBuffer(splitImage),
+                    bytes: splitDataBytes,
+                };
+                // Start a new split. Every split is considered a full image by the
+                // bootloader, so we need to skip the *total* written blocks.
+                logVerbose(`Starting new split: skipping first ${splitBlocks} blocks and adding chunk`);
+                splitChunks = [
+                    {
+                        type: ChunkType.Skip,
+                        blocks: splitBlocks,
+                        data: new Blob([]),
+                        dataBytes: 0,
+                    },
+                    chunk,
+                ];
+                splitDataBytes = chunk.dataBytes;
+            }
         }
     }
     // Finish the final split if necessary
@@ -7987,8 +8015,6 @@ const USER_ACTION_MAP = {
     wipe: "Wiping",
     reboot: "Restarting",
 };
-const BOOTLOADER_REBOOT_TIME = 4000; // ms
-const FASTBOOTD_REBOOT_TIME = 16000; // ms
 const USERDATA_ERASE_TIME = 1000; // ms
 // Wrapper for Entry#getData() that unwraps ProgressEvent errors
 async function zipGetData(entry, writer, options) {
@@ -8071,34 +8097,37 @@ async function checkRequirements(device, androidInfo) {
         }
     }
 }
-async function tryReboot(device, target, onReconnect) {
-    try {
-        await device.reboot(target, false);
-    }
-    catch (e) {
-        /* Failed = device rebooted by itself */
-    }
-    await device.waitForConnect(onReconnect);
-}
 async function flashZip(device, blob, wipe, onReconnect, onProgress = (_action, _item, _progress) => { }) {
     onProgress("load", "package", 0.0);
     let reader = new ZipReader(new BlobReader(blob));
     let entries = await reader.getEntries();
     // Bootloader and radio packs can only be flashed in the bare-metal bootloader
-    if ((await device.getVariable("is-userspace")) === "yes") {
-        await device.reboot("bootloader", true, onReconnect);
-    }
+    // if ((await device.getVariable("is-userspace")) === "yes") {
+    //     await device.reboot("bootloader", true, onReconnect);
+    // }
     // 1. Bootloader pack
-    await tryFlashImages(device, entries, onProgress, ["bootloader"]);
-    await runWithTimedProgress(onProgress, "reboot", "device", BOOTLOADER_REBOOT_TIME, tryReboot(device, "bootloader", onReconnect));
+    // await tryFlashImages(device, entries, onProgress, ["bootloader"]);
+    // await common.runWithTimedProgress(
+    //     onProgress,
+    //     "reboot",
+    //     "device",
+    //     BOOTLOADER_REBOOT_TIME,
+    //     tryReboot(device, "bootloader", onReconnect)
+    // );
     // 2. Radio pack
-    await tryFlashImages(device, entries, onProgress, ["radio"]);
-    await runWithTimedProgress(onProgress, "reboot", "device", BOOTLOADER_REBOOT_TIME, tryReboot(device, "bootloader", onReconnect));
+    // await tryFlashImages(device, entries, onProgress, ["radio"]);
+    // await common.runWithTimedProgress(
+    //     onProgress,
+    //     "reboot",
+    //     "device",
+    //     BOOTLOADER_REBOOT_TIME,
+    //    tryReboot(device, "bootloader", onReconnect)
+    // );
     // Cancel snapshot update if in progress
-    let snapshotStatus = await device.getVariable("snapshot-update-status");
-    if (snapshotStatus !== null && snapshotStatus !== "none") {
-        await device.runCommand("snapshot-update:cancel");
-    }
+    // let snapshotStatus = await device.getVariable("snapshot-update-status");
+    // if (snapshotStatus !== null && snapshotStatus !== "none") {
+    //     await device.runCommand("snapshot-update:cancel");
+    // }
     // Load nested images for the following steps
     logDebug("Loading nested images from zip");
     onProgress("unpack", "images", 0.0);
@@ -8118,37 +8147,11 @@ async function flashZip(device, blob, wipe, onReconnect, onProgress = (_action, 
     }
     // 4. Boot-critical images
     await tryFlashImages(device, imageEntries, onProgress, BOOT_CRITICAL_IMAGES);
-    // 5. Super partition template
-    // This is also where we reboot to fastbootd.
-    entry = imageEntries.find((e) => e.filename === "super_empty.img");
-    if (entry !== undefined) {
-        await runWithTimedProgress(onProgress, "reboot", "device", FASTBOOTD_REBOOT_TIME, device.reboot("fastboot", true, onReconnect));
-        let superName = await device.getVariable("super-partition-name");
-        if (!superName) {
-            superName = "super";
-        }
-        let superAction = wipe ? "wipe" : "flash";
-        onProgress(superAction, "super", 0.0);
-        let superBlob = await zipGetData(entry, new BlobWriter("application/octet-stream"));
-        await device.upload(superName, await readBlobAsBuffer(superBlob), (progress) => {
-            onProgress(superAction, "super", progress);
-        });
-        await device.runCommand(`update-super:${superName}${wipe ? ":wipe" : ""}`);
-    }
     // 6. Remaining system images
     await tryFlashImages(device, imageEntries, onProgress, SYSTEM_IMAGES);
     // We unconditionally reboot back to the bootloader here if we're in fastbootd,
     // even when there's no custom AVB key, because common follow-up actions like
     // locking the bootloader and wiping data need to be done in the bootloader.
-    if ((await device.getVariable("is-userspace")) === "yes") {
-        await runWithTimedProgress(onProgress, "reboot", "device", BOOTLOADER_REBOOT_TIME, device.reboot("bootloader", true, onReconnect));
-    }
-    // 7. Custom AVB key
-    entry = entries.find((e) => e.filename.endsWith("avb_pkmd.bin"));
-    if (entry !== undefined) {
-        await device.runCommand("erase:avb_custom_key");
-        await flashEntryBlob(device, entry, onProgress, "avb_custom_key");
-    }
     // 8. Wipe userdata
     if (wipe) {
         await runWithTimedProgress(onProgress, "wipe", "data", USERDATA_ERASE_TIME, device.runCommand("erase:userdata"));
@@ -8517,7 +8520,7 @@ class FastbootDevice {
         }
         let downloadSize = parseInt(downloadResp.dataSize, 16);
         if (downloadSize !== buffer.byteLength) {
-            throw new FastbootError("FAIL", `Bootloader wants ${buffer.byteLength} bytes, requested to send ${buffer.byteLength} bytes`);
+            throw new FastbootError("FAIL", `Bootloader wants ${downloadSize} bytes, requested to send ${buffer.byteLength} bytes`);
         }
         logDebug(`Sending payload: ${buffer.byteLength} bytes`);
         await this._sendRawPayload(buffer, onProgress);
