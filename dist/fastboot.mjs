@@ -8129,18 +8129,25 @@ async function flashZip(device, blob, wipe, onReconnect, onProgress = (_action, 
     //     await device.runCommand("snapshot-update:cancel");
     // }
     // Load nested images for the following steps
-    logDebug("Loading nested images from zip");
-    onProgress("unpack", "images", 0.0);
-    let entry = entries.find((e) => e.filename.match(/image-.+\.zip$/));
-    let imagesBlob = await zipGetData(entry, new BlobWriter("application/zip"), {
-        onprogress: (bytes, len) => {
-            onProgress("unpack", "images", bytes / len);
-        },
-    });
-    let imageReader = new ZipReader(new BlobReader(imagesBlob));
-    let imageEntries = await imageReader.getEntries();
+    // common.logDebug("Loading nested images from zip");
+    // onProgress("unpack", "images", 0.0);
+    // let entry = entries.find((e) => e.filename.match(/image-.+\.zip$/));
+    // if (!entry) {
+    //     throw new Error("No nested image zip found in the package.");
+    // }
+    // let imagesBlob = await zipGetData(
+    //     entry!,
+    //     new BlobWriter("application/zip"),
+    //     {
+    //         onprogress: (bytes: number, len: number) => {
+    //             onProgress("unpack", "images", bytes / len);
+    //         },
+    //     }
+    // );
+    // let imageReader = new ZipReader(new BlobReader(imagesBlob));
+    let imageEntries = entries;
     // 3. Check requirements
-    entry = imageEntries.find((e) => e.filename === "android-info.txt");
+    let entry = imageEntries.find((e) => e.filename === "android-info.txt");
     if (entry !== undefined) {
         let reqText = await zipGetData(entry, new TextWriter());
         await checkRequirements(device, reqText);
