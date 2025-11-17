@@ -214,35 +214,35 @@ export async function flashZip(
     let entries = await reader.getEntries();
 
     // Bootloader and radio packs can only be flashed in the bare-metal bootloader
-    if ((await device.getVariable("is-userspace")) === "yes") {
-        await device.reboot("bootloader", true, onReconnect);
-    }
+    // if ((await device.getVariable("is-userspace")) === "yes") {
+    //     await device.reboot("bootloader", true, onReconnect);
+    // }
 
     // 1. Bootloader pack
-    await tryFlashImages(device, entries, onProgress, ["bootloader"]);
-    await common.runWithTimedProgress(
-        onProgress,
-        "reboot",
-        "device",
-        BOOTLOADER_REBOOT_TIME,
-        tryReboot(device, "bootloader", onReconnect)
-    );
+    // await tryFlashImages(device, entries, onProgress, ["bootloader"]);
+    // await common.runWithTimedProgress(
+    //     onProgress,
+    //     "reboot",
+    //     "device",
+    //     BOOTLOADER_REBOOT_TIME,
+    //     tryReboot(device, "bootloader", onReconnect)
+    // );
 
     // 2. Radio pack
-    await tryFlashImages(device, entries, onProgress, ["radio"]);
-    await common.runWithTimedProgress(
-        onProgress,
-        "reboot",
-        "device",
-        BOOTLOADER_REBOOT_TIME,
-        tryReboot(device, "bootloader", onReconnect)
-    );
+    // await tryFlashImages(device, entries, onProgress, ["radio"]);
+    // await common.runWithTimedProgress(
+    //     onProgress,
+    //     "reboot",
+    //     "device",
+    //     BOOTLOADER_REBOOT_TIME,
+    //    tryReboot(device, "bootloader", onReconnect)
+    // );
 
     // Cancel snapshot update if in progress
-    let snapshotStatus = await device.getVariable("snapshot-update-status");
-    if (snapshotStatus !== null && snapshotStatus !== "none") {
-        await device.runCommand("snapshot-update:cancel");
-    }
+    // let snapshotStatus = await device.getVariable("snapshot-update-status");
+    // if (snapshotStatus !== null && snapshotStatus !== "none") {
+    //     await device.runCommand("snapshot-update:cancel");
+    // }
 
     // Load nested images for the following steps
     common.logDebug("Loading nested images from zip");
@@ -275,63 +275,12 @@ export async function flashZip(
         BOOT_CRITICAL_IMAGES
     );
 
-    // 5. Super partition template
-    // This is also where we reboot to fastbootd.
-    entry = imageEntries.find((e) => e.filename === "super_empty.img");
-    if (entry !== undefined) {
-        await common.runWithTimedProgress(
-            onProgress,
-            "reboot",
-            "device",
-            FASTBOOTD_REBOOT_TIME,
-            device.reboot("fastboot", true, onReconnect)
-        );
-
-        let superName = await device.getVariable("super-partition-name");
-        if (!superName) {
-            superName = "super";
-        }
-
-        let superAction = wipe ? "wipe" : "flash";
-        onProgress(superAction, "super", 0.0);
-        let superBlob = await zipGetData(
-            entry,
-            new BlobWriter("application/octet-stream")
-        );
-        await device.upload(
-            superName,
-            await common.readBlobAsBuffer(superBlob),
-            (progress) => {
-                onProgress(superAction, "super", progress);
-            }
-        );
-        await device.runCommand(
-            `update-super:${superName}${wipe ? ":wipe" : ""}`
-        );
-    }
-
     // 6. Remaining system images
     await tryFlashImages(device, imageEntries, onProgress, SYSTEM_IMAGES);
 
     // We unconditionally reboot back to the bootloader here if we're in fastbootd,
     // even when there's no custom AVB key, because common follow-up actions like
     // locking the bootloader and wiping data need to be done in the bootloader.
-    if ((await device.getVariable("is-userspace")) === "yes") {
-        await common.runWithTimedProgress(
-            onProgress,
-            "reboot",
-            "device",
-            BOOTLOADER_REBOOT_TIME,
-            device.reboot("bootloader", true, onReconnect)
-        );
-    }
-
-    // 7. Custom AVB key
-    entry = entries.find((e) => e.filename.endsWith("avb_pkmd.bin"));
-    if (entry !== undefined) {
-        await device.runCommand("erase:avb_custom_key");
-        await flashEntryBlob(device, entry, onProgress, "avb_custom_key");
-    }
 
     // 8. Wipe userdata
     if (wipe) {
